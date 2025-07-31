@@ -9,3 +9,5 @@ libraries
 	cv2
 	matplotlib
 	Xception
+Model download :
+	https://drive.google.com/file/d/1ZE-oRfPgsnXVcsXnv5IQ6Jmsb8MG-C9J/view?usp=sharing
