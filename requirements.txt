@@ -1,0 +1,11 @@
+libraries
+	tensorflow
+	keras
+	scikit-learn
+	opencv-python
+	matplotlib
+	numpy
+	pyngrok
+	cv2
+	matplotlib
+	Xception
