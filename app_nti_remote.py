@@ -1,27 +1,33 @@
 import streamlit as st
 import numpy as np
 import cv2
-import requests
 import gdown
 import h5py
+import hashlib
 from pathlib import Path
 from tensorflow.keras.models import load_model
 
-# --------------------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Streamlit Page Setup
+# ------------------------------------------------------------------------------
 st.set_page_config(page_title="🔥 Burn Severity Classifier", layout="centered")
 
+# ------------------------------------------------------------------------------
+# Config via Secrets
+#   - Put these in Streamlit Cloud → Settings → Secrets
+#   - Example:
+#       MODEL_DRIVE_ID = "1ZE-oRfPgsnXVcsXnv5IQ6Jmsb8MG-C9J"
+#       # MODEL_SHA256 = "optional_sha256_here"
+# ------------------------------------------------------------------------------
 MODEL_PATH = Path("model.h5")
-# Put this in Streamlit Cloud → Settings → Secrets
-# MODEL_URL must be a *direct* or share link; gdown can handle both.
-MODEL_URL = st.secrets["MODEL_URL"]               # e.g. "https://drive.google.com/uc?export=download&id=FILE_ID"
-MODEL_SHA256 = st.secrets.get("MODEL_SHA256")     # optional integrity check
+DRIVE_ID = st.secrets["MODEL_DRIVE_ID"]                   # REQUIRED
+MODEL_SHA256 = st.secrets.get("MODEL_SHA256", None)       # OPTIONAL
 
-# --------------------------------------------------------------------------------------
-# Download utilities (robust for Google Drive)
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
 def _is_valid_h5(path: Path) -> bool:
+    """Return True if file is a readable HDF5 (.h5) model."""
     try:
         with h5py.File(path, "r"):
             return True
@@ -29,66 +35,59 @@ def _is_valid_h5(path: Path) -> bool:
         return False
 
 def _sha256(path: Path) -> str:
-    import hashlib
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
 
-def _download_with_requests(url: str, out: Path) -> None:
-    r = requests.get(url, stream=True, allow_redirects=True, timeout=60)
-    r.raise_for_status()
-    with open(out, "wb") as f:
-        for chunk in r.iter_content(8192):
-            if chunk:
-                f.write(chunk)
+def _download_from_drive_by_id(file_id: str, out_path: Path):
+    """
+    Use gdown with a Drive file ID only.
+    Handles 'too large to scan' confirm token automatically.
+    """
+    # ensure clean target
+    out_path.unlink(missing_ok=True)
+    # gdown accepts id=... and handles cookies/confirm tokens
+    gdown.download(id=file_id, output=str(out_path), quiet=False, use_cookies=True)
 
-def _download_with_gdown(url_or_id: str, out: Path) -> None:
-    # Supports Google Drive share links, uc? links, or raw file IDs
-    gdown.download(url_or_id, str(out), quiet=False, fuzzy=True)
-
-def download_model():
-    # If a good model already exists, reuse it (and optionally verify checksum)
+def _ensure_model():
+    """
+    Make sure a valid model exists locally:
+    - reuse if valid (and checksum ok when provided)
+    - otherwise download via gdown using the Drive file ID
+    - verify it's a valid HDF5 and optional checksum
+    """
+    # Reuse valid file (and verify checksum if provided)
     if MODEL_PATH.exists() and _is_valid_h5(MODEL_PATH):
         if MODEL_SHA256 and _sha256(MODEL_PATH) != MODEL_SHA256:
-            MODEL_PATH.unlink(missing_ok=True)   # bad checksum → re-download
+            MODEL_PATH.unlink(missing_ok=True)
         else:
             return
 
-    # Clean any partial file
-    if MODEL_PATH.exists():
-        MODEL_PATH.unlink(missing_ok=True)
+    with st.spinner("Downloading model from Google Drive…"):
+        _download_from_drive_by_id(DRIVE_ID, MODEL_PATH)
 
-    # Try normal HTTP first (works for many hosts)
-    try:
-        with st.spinner("Downloading model (method 1)…"):
-            _download_with_requests(MODEL_URL, MODEL_PATH)
-    except Exception:
-        # Fallback to gdown which handles Google Drive confirm tokens & big files
-        if MODEL_PATH.exists():
-            MODEL_PATH.unlink(missing_ok=True)
-        with st.spinner("Downloading model (method 2: gdown)…"):
-            _download_with_gdown(MODEL_URL, MODEL_PATH)
-
-    # Validate the downloaded file
+    # Validate format
     if not _is_valid_h5(MODEL_PATH):
+        size_mb = MODEL_PATH.stat().st_size / 1e6 if MODEL_PATH.exists() else 0.0
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
-            "Downloaded file is not a valid .h5 model. "
-            "Double‑check MODEL_URL (Drive often returns an HTML page if the link/permission is wrong)."
+            f"Downloaded file is not a valid .h5 (size={size_mb:.2f} MB). "
+            "Check MODEL_DRIVE_ID permissions (Anyone with the link) and that the file is a Keras .h5."
         )
 
+    # Optional integrity check
     if MODEL_SHA256 and _sha256(MODEL_PATH) != MODEL_SHA256:
         MODEL_PATH.unlink(missing_ok=True)
-        raise RuntimeError("Downloaded model checksum mismatch. Re-check MODEL_URL or SHA256.")
+        raise RuntimeError("Downloaded model checksum mismatch. Re-check MODEL_DRIVE_ID or SHA256.")
 
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Model + preprocessing
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 @st.cache_resource(show_spinner=True)
 def load_burn_model():
-    download_model()
+    _ensure_model()
     return load_model(str(MODEL_PATH))
 
 @st.cache_data(show_spinner=False)
@@ -103,9 +102,9 @@ def preprocess_image(file_bytes, target_size=(128, 128)):
     batched = np.expand_dims(normalized, axis=0).astype("float32")
     return resized, batched
 
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # UI
-# --------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 def main():
     st.title("🔥 Burn Severity Classifier")
     st.caption("Upload a skin burn image to classify it as First, Second, or Third degree.")
@@ -115,22 +114,26 @@ def main():
         st.info("👈 Please upload a JPG or PNG image to continue.")
         return
 
+    # Load model (downloads once, then cached)
     try:
         model = load_burn_model()
     except Exception as e:
         st.error(f"Model load failed: {e}")
         st.stop()
 
+    # Preprocess
     try:
         img_preview, input_tensor = preprocess_image(uploaded.read())
     except Exception as e:
         st.error(f"Image processing failed: {e}")
         st.stop()
 
+    # Show preview
     st.image(img_preview, caption="🖼️ Uploaded Image", use_column_width=True)
     st.markdown("---")
     st.subheader("📊 Prediction")
 
+    # Predict
     with st.spinner("Analyzing burn severity..."):
         preds = model.predict(input_tensor)[0]
         idx = int(np.argmax(preds))
