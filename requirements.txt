@@ -1,13 +1,6 @@
-libraries
-	tensorflow
-	keras
-	scikit-learn
-	opencv-python
-	matplotlib
-	numpy
-	pyngrok
-	cv2
-	matplotlib
-	Xception
-Model download :
-	https://drive.google.com/file/d/1ZE-oRfPgsnXVcsXnv5IQ6Jmsb8MG-C9J/view?usp=sharing
+streamlit
+tensorflow-cpu==2.15.0
+opencv-python-headless==4.8.1.78
+numpy==1.23.5
+Pillow
+requests
