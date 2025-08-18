@@ -5,7 +5,7 @@ import gdown
 import h5py
 import hashlib
 from pathlib import Path
-from tensorflow.keras.models import load_model
+import keras  # ⬅️ use KERAS 3 loader (not tensorflow.keras)
 
 # ------------------------------------------------------------------------------
 # Streamlit Page Setup
@@ -46,9 +46,7 @@ def _download_from_drive_by_id(file_id: str, out_path: Path):
     Use gdown with a Drive file ID only.
     Handles 'too large to scan' confirm token automatically.
     """
-    # ensure clean target
     out_path.unlink(missing_ok=True)
-    # gdown accepts id=... and handles cookies/confirm tokens
     gdown.download(id=file_id, output=str(out_path), quiet=False, use_cookies=True)
 
 def _ensure_model():
@@ -58,7 +56,6 @@ def _ensure_model():
     - otherwise download via gdown using the Drive file ID
     - verify it's a valid HDF5 and optional checksum
     """
-    # Reuse valid file (and verify checksum if provided)
     if MODEL_PATH.exists() and _is_valid_h5(MODEL_PATH):
         if MODEL_SHA256 and _sha256(MODEL_PATH) != MODEL_SHA256:
             MODEL_PATH.unlink(missing_ok=True)
@@ -74,7 +71,7 @@ def _ensure_model():
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
             f"Downloaded file is not a valid .h5 (size={size_mb:.2f} MB). "
-            "Check MODEL_DRIVE_ID permissions (Anyone with the link) and that the file is a Keras .h5."
+            "Check MODEL_DRIVE_ID permissions (Anyone with the link) and that the file is a Keras 3 .h5."
         )
 
     # Optional integrity check
@@ -88,7 +85,8 @@ def _ensure_model():
 @st.cache_resource(show_spinner=True)
 def load_burn_model():
     _ensure_model()
-    return load_model(str(MODEL_PATH))
+    # ⬇️ Load with KERAS 3
+    return keras.models.load_model(str(MODEL_PATH))
 
 @st.cache_data(show_spinner=False)
 def preprocess_image(file_bytes, target_size=(128, 128)):
