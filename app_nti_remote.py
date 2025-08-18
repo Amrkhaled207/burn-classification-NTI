@@ -5,29 +5,28 @@ import gdown
 import h5py
 import hashlib
 from pathlib import Path
-import keras  # ⬅️ use KERAS 3 loader (not tensorflow.keras)
+import keras
+import tensorflow as tf
 
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # Streamlit Page Setup
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 st.set_page_config(page_title="🔥 Burn Severity Classifier", layout="centered")
 
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # Config via Secrets
-#   - Put these in Streamlit Cloud → Settings → Secrets
-#   - Example:
+#   - Streamlit Cloud → Settings → Secrets:
 #       MODEL_DRIVE_ID = "1ZE-oRfPgsnXVcsXnv5IQ6Jmsb8MG-C9J"
 #       # MODEL_SHA256 = "optional_sha256_here"
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 MODEL_PATH = Path("model.h5")
-DRIVE_ID = st.secrets["MODEL_DRIVE_ID"]                   # REQUIRED
-MODEL_SHA256 = st.secrets.get("MODEL_SHA256", None)       # OPTIONAL
+DRIVE_ID = st.secrets["MODEL_DRIVE_ID"]
+MODEL_SHA256 = st.secrets.get("MODEL_SHA256")
 
-# ------------------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Helpers (download / validate)
+# --------------------------------------------------------------------------------------
 def _is_valid_h5(path: Path) -> bool:
-    """Return True if file is a readable HDF5 (.h5) model."""
     try:
         with h5py.File(path, "r"):
             return True
@@ -42,51 +41,94 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 def _download_from_drive_by_id(file_id: str, out_path: Path):
-    """
-    Use gdown with a Drive file ID only.
-    Handles 'too large to scan' confirm token automatically.
-    """
     out_path.unlink(missing_ok=True)
+    # gdown handles Drive confirm tokens / large files
     gdown.download(id=file_id, output=str(out_path), quiet=False, use_cookies=True)
 
 def _ensure_model():
-    """
-    Make sure a valid model exists locally:
-    - reuse if valid (and checksum ok when provided)
-    - otherwise download via gdown using the Drive file ID
-    - verify it's a valid HDF5 and optional checksum
-    """
+    # reuse valid file
     if MODEL_PATH.exists() and _is_valid_h5(MODEL_PATH):
         if MODEL_SHA256 and _sha256(MODEL_PATH) != MODEL_SHA256:
             MODEL_PATH.unlink(missing_ok=True)
         else:
             return
-
     with st.spinner("Downloading model from Google Drive…"):
         _download_from_drive_by_id(DRIVE_ID, MODEL_PATH)
-
-    # Validate format
     if not _is_valid_h5(MODEL_PATH):
         size_mb = MODEL_PATH.stat().st_size / 1e6 if MODEL_PATH.exists() else 0.0
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
             f"Downloaded file is not a valid .h5 (size={size_mb:.2f} MB). "
-            "Check MODEL_DRIVE_ID permissions (Anyone with the link) and that the file is a Keras 3 .h5."
+            "Ensure sharing is 'Anyone with the link' and the file is a Keras .h5."
         )
-
-    # Optional integrity check
     if MODEL_SHA256 and _sha256(MODEL_PATH) != MODEL_SHA256:
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError("Downloaded model checksum mismatch. Re-check MODEL_DRIVE_ID or SHA256.")
 
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
+# Compatibility shim for Resizing layer (filters unknown kwargs)
+# --------------------------------------------------------------------------------------
+class ResizingShim(keras.layers.Layer):
+    """
+    Wraps keras.layers.Resizing but tolerates extra kwargs that older/newer
+    Keras variants may or may not recognize, such as:
+      - pad_to_aspect_ratio
+      - fill_mode
+      - fill_value
+    """
+    def __init__(self, *args, **kwargs):
+        # Keep only the kwargs actually supported by keras.layers.Resizing
+        allowed_keys = {
+            "height", "width", "interpolation",
+            "crop_to_aspect_ratio", "name", "dtype", "data_format",
+            # Keras 3 accepts 'dtype' as a policy; if not present it's fine
+        }
+        filtered = {k: v for k, v in kwargs.items() if k in allowed_keys}
+        # height & width may be positional in configs; handle both
+        if len(args) >= 2:
+            height, width = args[0], args[1]
+        else:
+            height = filtered.pop("height", None)
+            width = filtered.pop("width", None)
+        if height is None or width is None:
+            raise ValueError("ResizingShim requires 'height' and 'width'.")
+
+        self._inner = keras.layers.Resizing(
+            height=height,
+            width=width,
+            **filtered
+        )
+        super().__init__(name=filtered.get("name", "resizing_shim"), dtype=filtered.get("dtype", None))
+
+    def call(self, inputs):
+        return self._inner(inputs)
+
+    def get_config(self):
+        cfg = self._inner.get_config()
+        # Keep the layer name stable
+        cfg["name"] = self.name
+        return cfg
+
+# Some saved models may reference the fully qualified path; map common keys:
+CUSTOM_OBJECTS = {
+    "Resizing": ResizingShim,
+    # Occasionally the serialized path could be module-qualified; add aliases:
+    "keras.layers.Resizing": ResizingShim,
+    "keras.src.layers.preprocessing.image_preprocessing.Resizing": ResizingShim,
+}
+
+# --------------------------------------------------------------------------------------
 # Model + preprocessing
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 @st.cache_resource(show_spinner=True)
 def load_burn_model():
     _ensure_model()
-    # ⬇️ Load with KERAS 3
-    return keras.models.load_model(str(MODEL_PATH))
+    # Try plain load first; if it fails on Resizing kwargs, retry with shim
+    try:
+        return keras.models.load_model(str(MODEL_PATH))
+    except Exception:
+        # second attempt with custom_objects to swallow new kwargs
+        return keras.models.load_model(str(MODEL_PATH), custom_objects=CUSTOM_OBJECTS)
 
 @st.cache_data(show_spinner=False)
 def preprocess_image(file_bytes, target_size=(128, 128)):
@@ -100,9 +142,9 @@ def preprocess_image(file_bytes, target_size=(128, 128)):
     batched = np.expand_dims(normalized, axis=0).astype("float32")
     return resized, batched
 
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 # UI
-# ------------------------------------------------------------------------------
+# --------------------------------------------------------------------------------------
 def main():
     st.title("🔥 Burn Severity Classifier")
     st.caption("Upload a skin burn image to classify it as First, Second, or Third degree.")
@@ -126,12 +168,10 @@ def main():
         st.error(f"Image processing failed: {e}")
         st.stop()
 
-    # Show preview
     st.image(img_preview, caption="🖼️ Uploaded Image", use_column_width=True)
     st.markdown("---")
     st.subheader("📊 Prediction")
 
-    # Predict
     with st.spinner("Analyzing burn severity..."):
         preds = model.predict(input_tensor)[0]
         idx = int(np.argmax(preds))
